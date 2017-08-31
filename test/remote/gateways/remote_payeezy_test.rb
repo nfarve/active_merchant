@@ -30,12 +30,18 @@ class RemotePayeezyTest < Test::Unit::TestCase
     assert response = @gateway.purchase(@amount, @credit_card, @options)
     assert_match(/Transaction Normal/, response.message)
     assert_success response
+    puts response.inspect
   end
 
   def test_successful_purchase_with_echeck
     options = @options.merge({customer_id_type: "1", customer_id_number: "1", client_email: "test@example.com"})
     assert response = @gateway.purchase(@amount, @check, options)
     assert_match(/Transaction Normal/, response.message)
+    assert_success response
+  end
+
+  def test_successful_purchase_with_token
+    assert resppnse = @gateway.purchase(@amount, "2537446225198291", @options)
     assert_success response
   end
 
@@ -146,6 +152,12 @@ class RemotePayeezyTest < Test::Unit::TestCase
     response = @gateway.verify(@bad_credit_card, @options)
     assert_failure response
     assert_match %r{The credit card number check failed}, response.message
+  end
+
+  def test_successful_store
+    assert response = @gateway.store(@credit_card, @options)
+    assert_success response
+    puts response.inspect
   end
 
   def test_bad_creditcard_number

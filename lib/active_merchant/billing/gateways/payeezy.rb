@@ -3,9 +3,9 @@ module ActiveMerchant
     class PayeezyGateway < Gateway
       class_attribute :integration_url
 
-      self.test_url = 'https://api-cert.payeezy.com/v1/transactions'
+      self.test_url = 'https://api-cert.payeezy.com/v1'
       self.integration_url = 'https://api-cat.payeezy.com/v1/transactions'
-      self.live_url = 'https://api.payeezy.com/v1/transactions'
+      self.live_url = 'https://api.payeezy.com/v1'
 
       self.default_currency = 'USD'
       self.money_format = :cents
@@ -82,6 +82,18 @@ module ActiveMerchant
         commit(params, options)
       end
 
+      def store(credit_card, options = {})
+        params = {ta_token: "NOIW"}
+        params[:apikey]  = @options[:apikey]
+        params[:js_security_key] = @options[:js_security_key]
+        params[:type] = "FDTOKEN"
+        params[:callback] = "Payeezy.callback"
+        params[:credit_card] = {}
+        add_address(params, options)
+        add_payment_method(params, credit_card, options)
+        commit(params, options, true)
+      end
+
       def verify(credit_card, options={})
         MultiResponse.run(:use_first_response) do |r|
           r.process { authorize(100, credit_card, options) }
@@ -122,6 +134,8 @@ module ActiveMerchant
       def add_payment_method(params, payment_method, options)
         if payment_method.is_a? Check
           add_echeck(params, payment_method, options)
+        elsif payment_method.is_a?(String)
+          add_token(params, payment_method)
         else
           add_creditcard(params, payment_method)
         end
@@ -138,6 +152,16 @@ module ActiveMerchant
 
         params[:method] = 'credit_card'
         params[:credit_card] = credit_card
+      end
+
+      def add_token(params, payment_token)
+        token = {}
+        token[:token_type] = "FDToken"
+        token[:token_data] = {}
+        token[:token_data][:value] = payment_token
+        params[:method] = 'token'
+
+        params[:token] = token
       end
 
       def add_echeck(params, echeck, options)
@@ -179,26 +203,21 @@ module ActiveMerchant
         params[:soft_descriptors] = options[:soft_descriptors] if options[:soft_descriptors]
       end
 
-      def commit(params, options)
-        url = if options[:integration]
-          integration_url
-        elsif test?
-          test_url
-        else
-          live_url
-        end
-
-        if transaction_id = params.delete(:transaction_id)
-          url = "#{url}/#{transaction_id}"
-        end
-
+      def commit(params, option, store=false)
+        url = build_url(params, option, store)
+        
         begin
           body = params.to_json
-          response = parse(ssl_post(url, body, headers(body)))
+          if store
+            response = parse(ssl_get(url))
+
+          else
+            response = parse(ssl_post(url, body, headers(body)))
+          end
         rescue ResponseError => e
           response = response_error(e.response.body)
         rescue JSON::ParserError
-          response = json_error(raw_response)
+          response = json_error(response)
         end
 
         Response.new(
@@ -207,23 +226,67 @@ module ActiveMerchant
           response,
           test: test?,
           authorization: authorization_from(params, response),
-          avs_result: {code: response['avs']},
+          avs_result: {code: response['avs'] || response['results']['avs']},
           cvv_result: response['cvv2'],
           error_code: error_code(response, success_from(response))
         )
       end
 
+      def build_url(params, options, store)
+        if options[:integration]
+         url =  integration_url
+        elsif store
+          url = "#{test? ? self.test_url : self.live_url}/securitytokens"
+          if params
+            url << '?'
+            url << map_params(params)  #encode(params)
+          end
+        else
+          url = "#{test? ? self.test_url : self.live_url}/transactions"
+        end
+
+        if transaction_id = params.delete(:transaction_id)
+          url = "#{url}/#{transaction_id}"
+        end
+        url
+      end
+
+      def map_params(hash)
+        hash.map do |key, value|
+          next if value != false && value.blank?
+          if value.is_a?(Hash)
+            h = {}
+            value.each do |k, v|
+              h["#{key}.#{k}"] = v unless v.blank?
+            end
+            map_params(h)
+          elsif value.is_a?(Array)
+            value.map { |v| "#{key}[]=#{CGI.escape(v.to_s)}" }.join("&")
+          else
+            "#{key}=#{CGI.escape(value.to_s)}"
+          end
+        end.compact.join("&")
+      end
+
+      def encode(hash)
+         hash.collect{|(k,v)| "#{CGI.escape(k.to_s)}=#{CGI.escape(v.to_s)}"}.join('&')
+      end
+
       def success_from(response)
-        response['transaction_status'] == 'approved'
+        response['transaction_status'] == 'approved' ||  response['results']['status'] == 'success'
       end
 
       def authorization_from(params, response)
-        [
-          response['transaction_id'],
-          response['transaction_tag'],
-          params[:method],
-          (response['amount'] && response['amount'].to_i)
-        ].join('|')
+        if response["method"]
+          [
+            response['transaction_id'],
+            response['transaction_tag'],
+            params[:method],
+            (response['amount'] && response['amount'].to_i)
+          ].join('|')
+        else
+          response["results"]["token"]["value"]
+        end
       end
 
       def generate_hmac(nonce, current_timestamp, payload)
@@ -273,7 +336,7 @@ module ActiveMerchant
       end
 
       def parse(body)
-        JSON.parse(body)
+        JSON.parse(body.match(/\{[^)]+\}/)[0])
       end
 
       def response_error(raw_response)
